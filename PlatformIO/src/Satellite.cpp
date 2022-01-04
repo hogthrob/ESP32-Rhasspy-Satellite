@@ -166,7 +166,12 @@
 #include <General.hpp>
 #include <StateMachine.hpp>
 
+
 void setup() {
+  // store the main task handle, used to decided if in the 
+  // FSM task (aka main loop) or in another task context. 
+  fsm_task = xTaskGetCurrentTaskHandle();
+
   Serial.begin(115200);
   Serial.println("Booting");
 
@@ -175,6 +180,13 @@ void setup() {
     wbSemaphore = xSemaphoreCreateMutex();  // Create a mutex semaphore
     if ((wbSemaphore) != NULL) xSemaphoreGive(wbSemaphore);  // Free for all
   }
+
+  if (eventListSemaphore == NULL)  // Not yet been created?
+  {
+    eventListSemaphore = xSemaphoreCreateMutex();  // Create a mutex semaphore
+    if ((eventListSemaphore) != NULL) xSemaphoreGive(eventListSemaphore);  // Free for all
+  }
+
 
   device->init();
 
@@ -198,7 +210,7 @@ void setup() {
   ArduinoOTA
     .onStart([]() {
       Serial.println("Uploading...");
-      send_event(UpdateEvent());
+      send_event(events::UpdateEvent);
     })
     .onEnd([]() {
       Serial.println("\nEnd");
@@ -231,12 +243,38 @@ void loop() {
     ArduinoOTA.handle();
   }
 
-  // unless we are not connected, reconnect now using new settings
-  if (doReconnect) 
-  {
-    send_event(MQTTDisconnectedEvent());
-  }
-  doReconnect = false;
+// small help macro
+#define handleEvent(event_name) ((events::event_name == event)?handle_event( event_name ()):false)
   
+  // check of there is an queued event from another task, but only if we can get the eventListSemaphore
+  if (fsm_event.empty() == false && xSemaphoreTake(eventListSemaphore, portMAX_DELAY))
+  {
+    events::Events event = fsm_event.front();
+    fsm_event.pop_front();
+    // 
+    xSemaphoreGive(eventListSemaphore);
+
+    handleEvent(WifiDisconnectEvent);
+    handleEvent(WifiConnectEvent);
+    handleEvent(MQTTDisconnectedEvent);
+    handleEvent(MQTTConnectedEvent);
+    handleEvent(UpdateEvent);
+    handleEvent(IdleEvent);
+    handleEvent(TtsEvent);
+    handleEvent(ErrorEvent);
+    handleEvent(BeginPlayAudioEvent);
+    handleEvent(EndPlayAudioEvent);
+    handleEvent(StreamAudioEvent);
+    handleEvent(PlayBytesEvent);
+    handleEvent(ListeningEvent);
+    handleEvent(UpdateConfigurationEvent);
+  }
+
+  if (doReconnect)
+  {
+    doReconnect = false;
+    send_event(events::MQTTDisconnectedEvent);
+  }
+
   fsm::run();
 }

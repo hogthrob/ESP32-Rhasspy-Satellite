@@ -2,6 +2,7 @@
 
 #include <tinyfsm.hpp>
 #include <Arduino.h>
+#include <list>
 
 #if NETWORK_TYPE == NETWORK_ETHERNET
     #include <ETH.h>
@@ -17,6 +18,7 @@
 #include "index_html.h"
 #include "Esp32RingBuffer.h"
 #include <map>
+// #include "WiFiClientSecure.h"
 
 const int PLAY = BIT0;
 const int STREAM = BIT1;
@@ -83,7 +85,10 @@ std::string sayTopic = "hermes/tts/say";
 std::string sayFinishedTopic = "hermes/tts/sayFinished";
 std::string errorTopic = "hermes/nlu/intentNotRecognized";
 AsyncMqttClient asyncClient; 
+//WiFiClientSecure net;
 WiFiClient net;
+
+
 PubSubClient audioServer(net); 
 Esp32RingBuffer<uint8_t, uint16_t, (1U << 15)> audioData;
 long message_size = 0;
@@ -94,6 +99,7 @@ int bitDepth = 16;
 StateColors current_colors = COLORS_IDLE;
 static EventGroupHandle_t audioGroup;
 SemaphoreHandle_t wbSemaphore;
+SemaphoreHandle_t eventListSemaphore;
 TaskHandle_t i2sHandle;
 
 struct WifiConnected;
@@ -124,6 +130,38 @@ struct StreamAudioEvent : tinyfsm::Event { };
 struct PlayBytesEvent : tinyfsm::Event {};
 struct ListeningEvent : tinyfsm::Event { };
 struct UpdateConfigurationEvent : tinyfsm::Event { };
+
+// tasks
+// Main Task runs ALL fsm code, State*::entry/run, react
+// AsyncWebServer Task runs web front end, changes device object and other config objects, saves config to NVM
+// AsyncMqttClient Task 
+// WifEvent Task
+// I2S Task 
+// IndicatorLight Task (if used by device)
+
+namespace events
+{
+enum Events {
+NoEvent = 0,
+WifiDisconnectEvent,    // State::[*]-> WifiDisconnected -> State::WifiDisconnect , issued only by Wifi onEvent task outside FSM
+WifiConnectEvent,       // State::[*]-> WifiConnected -> WifiConnect, practically * == WifiDisconnect, issued only by Wifi onEvent task outside FSM
+MQTTDisconnectedEvent,  // State::[* - WifiDisconnected, WifiConnected, MqttDisconnected] -> MqttDisconnected, issued only by I2STask outside FSM
+MQTTConnectedEvent,     // State::[*] -> MqttConnected, never issued
+IdleEvent,              // State::[Tts,Listening,Error] -> Idle,  issued only by AsyncMqttClient task (toggleOn)
+TtsEvent,               // State::[Listening,Idle] -> Tts,  issued only by AsyncMqttClient task (sayTopic,toggleOff)
+ErrorEvent,             // State::[Idle] -> Error,  issued only by AsyncMqttClient task (errorTopic)
+UpdateEvent,            // State::[Idle,ErrorPlay] -> Updating,  issued only by main task
+BeginPlayAudioEvent,    // State::[Tts] -> TtsPlay, State::[Listening] -> ListeningPlay, State::[Listening] -> IdlePlay, State::[Error] -> ErrorPlay, dispatched from PlayBytesEvent 
+EndPlayAudioEvent,      // State::[TtsPlay] -> Tts, State::[ListeningPlay] -> Listening, State::[IdlePlay] -> Idle, State::[ErrorPlay] -> Error,  dispatched from StreamAudioEvent
+StreamAudioEvent,       // dispatches EndPlayAudioEvent, issued by I2Stask outside FSM
+PlayBytesEvent,         // dispatches BeginPlayAudioEvent, issued by AsyncMqttClient(playBytes topic) outside FSM
+ListeningEvent,         // State::[Tts,Idle] -> Listening,  issued only by AsyncMqttClient task (sayFinishedTopic,toggleOff)
+UpdateConfigurationEvent, // State::[*] -> No State Change, issued only by AsyncMqttClient task (ledTopic)
+};
+};
+
+TaskHandle_t fsm_task = NULL;
+std::list<events::Events> fsm_event;
 
 void onMqttConnect(bool sessionPresent);
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason);

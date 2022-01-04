@@ -434,7 +434,6 @@ class WifiDisconnected : public StateMachine
           }
       }
     #endif
-
   }
   
   void react(MQTTDisconnectedEvent const &) {
@@ -447,10 +446,23 @@ FSM_INITIAL_STATE(StateMachine, WifiDisconnected)
 
 using fsm = tinyfsm::Fsm<StateMachine>;
 
+void send_event(events::Events event)
+{
+  if (xSemaphoreTake(eventListSemaphore, portMAX_DELAY)) {
+    if (std::find(fsm_event.begin(), fsm_event.end(), event) == fsm_event.end()) {
+      fsm_event.push_back(event);
+    }
+    xSemaphoreGive(eventListSemaphore);
+  } else {
+    // TODO: Decide what happens if the look cannot be acquirred...
+  }
+}
+
 template<typename E>
-void send_event(E const & event)
+bool handle_event(E const & event)
 {
   fsm::template dispatch<E>(event);
+  return true;
 }
 
 std::vector<std::string> explode( const std::string &delimiter, const std::string &str)
@@ -497,7 +509,7 @@ void push_i2s_data(const uint8_t *const payload, size_t len)
       if (xEventGroupGetBits(audioGroup) != PLAY)
       {
         publishDebug("Send PlayBytesEvent");
-        send_event(PlayBytesEvent());
+        send_event(events::PlayBytesEvent);
       }
       vTaskDelay(pdMS_TO_TICKS(50));
     } while (audioData.isFull());
@@ -535,7 +547,7 @@ void handle_playBytes(const std::string& topicstr, uint8_t *payload, size_t len,
     if (!audioData.isEmpty() && xEventGroupGetBits(audioGroup) != PLAY)
     {
       publishDebug("Send PlayBytesEvent");
-      send_event(PlayBytesEvent());
+      send_event(events::PlayBytesEvent);
     }
 
     std::vector<std::string> topicparts = explode("/", topicstr);
@@ -543,108 +555,86 @@ void handle_playBytes(const std::string& topicstr, uint8_t *payload, size_t len,
   }
 }
 
-void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total)
-{
-  const std::string topicstr(topic);
 
-  // complete or end of message has been received
-  if (len + index == total)
+
+struct OnMqttMessageTopicAction
+{
+  std::string& topicId; // which topic shall be handled, use   .topicId = *(new std::string("errorTopic")) to initialize with string constant
+  void (*action)(JsonObject& root); // pointer to function / lambda function to handle topics message
+};
+
+OnMqttMessageTopicAction onTopic[] =
+{
   {
-    if (topicstr.find(errorTopic.c_str()) != std::string::npos)
-    {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      // Check if this is for us
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
-        if (root["siteId"] == config.siteid.c_str()) {
-          Serial.println("Send ErrorEvent from errorTopic");
-          send_event(ErrorEvent());
-        }
+  .topicId = errorTopic,
+  .action = [](JsonObject& root) {
+      if (root["siteId"] == config.siteid.c_str()) {
+        Serial.println("Send ErrorEvent from errorTopic");
+        send_event(events::ErrorEvent);
       }
-    } else if (topicstr.find(sayFinishedTopic.c_str()) != std::string::npos)
-    {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      // Check if this is for us
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
-        if (root["siteId"] == config.siteid.c_str()) {
-          Serial.println("Send IdleEvent from sayFinishedTopic");
-          send_event(IdleEvent());
-        }
+    }
+  },
+  {
+  .topicId = sayFinishedTopic,
+  .action = [](JsonObject& root) {
+      if (root["siteId"] == config.siteid.c_str()) {
+        Serial.println("Send ListeningEvent from sayFinishedTopic");
+        send_event(events::ListeningEvent);
       }
-    } else if (topicstr.find(sayTopic.c_str()) != std::string::npos)
-    {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      // Check if this is for us
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
-        if (root["siteId"] == config.siteid.c_str()) {
-          Serial.println("Send TtsEvent from sayTopic");
-          send_event(TtsEvent());
-        }
+    }
+  },
+  {
+  .topicId = sayTopic,
+  .action = [](JsonObject& root) {
+      if (root["siteId"] == config.siteid.c_str()) {
+        Serial.println("Send TtsEvent from sayTopic");
+        send_event(events::TtsEvent);
       }
-    } else if (topicstr.find("toggleOff") != std::string::npos)
-    {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      // Check if this is for us
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
-        if (root["siteId"] == config.siteid.c_str() && root.containsKey("reason")) {
-          if (root["reason"] == "dialogueSession") {
-              Serial.println("Send ListeningEvent from toggleOff (dialogueSession)");
-              send_event(ListeningEvent());
-          }
-          if (root["reason"] == "ttsSay") {
-              Serial.println("Send TtsEvent from toggleOff (ttsSay)");
-              send_event(TtsEvent());
-          }
-          if (root["reason"] == "playAudio") {
-              Serial.println("Send ListeningEvent from toggleOff (playAudio)");
-              send_event(ListeningEvent());
-          }
+    }
+  },
+  {
+    .topicId = *(new std::string("toggleOff")),
+    .action = [](JsonObject& root) {
+      if (root["siteId"] == config.siteid.c_str() && root.containsKey("reason")) {
+        if (root["reason"] == "dialogueSession") {
+            Serial.println("Send ListeningEvent from toggleOff (dialogueSession)");
+            send_event(events::ListeningEvent);
         }
-      }
-    } else if (topicstr.find("toggleOn") != std::string::npos) {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      // Check if this is for us
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
-        if (root["siteId"] == config.siteid.c_str() && root.containsKey("reason")) {
-          if (root["reason"] == "dialogueSession") {
-              Serial.println("Send IdleEvent from toggleOn (dialogueSession)");
-              send_event(IdleEvent());
-          }
-          if (root["reason"] == "ttsSay") {
-              Serial.println("Send IdleEvent from toggleOn (ttsSay)");
-              send_event(IdleEvent());
-          }
-          if (root["reason"] == "playAudio") {
-              Serial.println("Send IdleEvent from toggleOn (playAudio)");
-             send_event(IdleEvent());
-          }
+        if (root["reason"] == "ttsSay") {
+            Serial.println("Send TtsEvent from toggleOff (ttsSay)");
+            send_event(events::TtsEvent);
+        }
+        if (root["reason"] == "playAudio") {
+            Serial.println("Send ListeningEvent from toggleOff (playAudio)");
+            send_event(events::ListeningEvent);
         }
       }
     }
-    else if (topicstr.find("playBytes") != std::string::npos)
-    {
-      handle_playBytes(topicstr, (uint8_t*)payload, len, index, total);
-    } else if (topicstr.find(ledTopic.c_str()) != std::string::npos) {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      bool saveNeeded = false;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
+  },
+  {
+    .topicId = *(new std::string("toggleOn")),
+    .action = [](JsonObject& root) {
+        if (root["siteId"] == config.siteid.c_str() && root.containsKey("reason")) {
+          if (root["reason"] == "dialogueSession") {
+              Serial.println("Send IdleEvent from toggleOn (dialogueSession)");
+              send_event(events::IdleEvent);
+          }
+          if (root["reason"] == "ttsSay") {
+              Serial.println("Send IdleEvent from toggleOn (ttsSay)");
+              send_event(events::IdleEvent);
+          }
+          if (root["reason"] == "playAudio") {
+              Serial.println("Send IdleEvent from toggleOn (playAudio)");
+              send_event(events::IdleEvent);
+          }
+        }
+      }
+  },
+  {
+    .topicId = ledTopic,
+    .action = [](JsonObject& root) {
+        bool saveNeeded = false;
+
         if (root.containsKey("animation")) {
           config.animation = (uint16_t)(root["animation"]);
           saveNeeded = true;
@@ -703,16 +693,12 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
         if (saveNeeded) {
           saveConfiguration(configfile, config);
         }
-        send_event(UpdateConfigurationEvent());
-      } else {
-        publishDebug(err.c_str());
-      }
-    } else if (topicstr.find(audioTopic.c_str()) != std::string::npos) {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
+        send_event(events::UpdateConfigurationEvent);
+    }
+  },
+  {
+    .topicId = audioTopic,
+    .action = [](JsonObject& root) {
         if (root.containsKey("mute_input")) {
           config.mute_input = (root["mute_input"] == "true") ? true : false;
         }
@@ -732,42 +718,74 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
           config.hotword_detection = (root["hotword"] == "local") ? HW_LOCAL : HW_REMOTE;
         }
         saveConfiguration(configfile, config);
-      } else {
-        publishDebug(err.c_str());
-      }
-    } else if (topicstr.find(restartTopic.c_str()) != std::string::npos) {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
-        if (root.containsKey("passwordhash")) {
-          if (root["passwordhash"] == OTA_PASS_HASH) {
-            ESP.restart();
-          }
+    }
+  },
+  {
+    .topicId = restartTopic,
+    .action = [](JsonObject& root) {
+      if (root.containsKey("passwordhash")) {
+        if (root["passwordhash"] == OTA_PASS_HASH) {
+          ESP.restart();
         }
-      } else {
-        publishDebug(err.c_str());
       }
-    } else if (topicstr.find(debugTopic.c_str()) != std::string::npos) {
-      std::string payloadstr(payload);
-      StaticJsonDocument<300> doc;
-      DeserializationError err = deserializeJson(doc, payloadstr.c_str());
-      if (!err) {
-        JsonObject root = doc.as<JsonObject>();
+    }
+  },
+  {
+    .topicId = debugTopic,
+    .action = [](JsonObject& root) {
         if (root.containsKey("debug")) {
           DEBUG = (root["debug"] == "true") ? true : false;
         }
+    }
+  },
+  {
+    .topicId = *(new std::string("toggleOff")),
+    .action = [](JsonObject& root) {
+
+    }
+  },
+
+
+};
+
+void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total)
+{
+  const std::string topicstr(topic);
+
+  // complete or end of message has been received
+  if (len + index == total) {
+    bool isHandled = false;
+    for(auto topicHandler: onTopic) {
+      isHandled = topicstr.find(topicHandler.topicId) != std::string::npos; 
+      if (isHandled) {
+        std::string payloadstr(payload);
+        StaticJsonDocument<300> doc;
+        DeserializationError err = deserializeJson(doc, payloadstr.c_str());
+        if (!err) {
+          JsonObject root = doc.as<JsonObject>();
+          topicHandler.action(root);
+        } else {
+          publishDebug(err.c_str());
+        }
+        // we are done with this loop, leave it
+        break;
+      }
+    }
+
+    if (isHandled == false) {
+      if (topicstr.find("playBytes") != std::string::npos) {
+        handle_playBytes(topicstr, (uint8_t*)payload, len, index, total);
+      } else {
+        char message[100];
+        snprintf(message, 100, "Unhandled message received, topic '%s'", topic);
+        publishDebug(message);
       }
     }
   } else {
     // len + index < total ==> partial message
-    if (topicstr.find("playBytes") != std::string::npos)
-    {
+    if (topicstr.find("playBytes") != std::string::npos) {
       handle_playBytes(topicstr, (uint8_t*)payload, len, index, total);
-    }
-    else
-    {
+    } else {
       char message[100];
       snprintf(message, 100, "Unhandled partial message received, topic '%s'", topic);
       publishDebug(message);
@@ -837,7 +855,7 @@ void I2Stask(void *p) {
 
       publishDebug("Done");
       publishDebug("Send StreamAudioEvent");
-      send_event(StreamAudioEvent());
+      send_event(events::StreamAudioEvent);
     }
     if (xEventGroupGetBits(audioGroup) == STREAM && !config.mute_input) {     
       xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
@@ -881,7 +899,8 @@ void I2Stask(void *p) {
       // ignore our requests in order to establish Wifi connection before
       // MQTT connection can be established
       xEventGroupClearBits(audioGroup, STREAM|PLAY); 
-      send_event(MQTTDisconnectedEvent());
+      
+      send_event(events::MQTTDisconnectedEvent);
     }
     //Added for stability when neither PLAY or STREAM is set.
     vTaskDelay(10);
@@ -931,10 +950,10 @@ void WiFiEvent(WiFiEvent_t event) {
             WiFi.setHostname(HOSTNAME);
             break;
         case SYSTEM_EVENT_STA_GOT_IP:
-            send_event(WifiConnectEvent());
+            send_event(events::WifiConnectEvent);
             break;
         case SYSTEM_EVENT_STA_DISCONNECTED:
-            send_event(WifiDisconnectEvent());
+            send_event(events::WifiDisconnectEvent);
             break;
         default:
             break;
