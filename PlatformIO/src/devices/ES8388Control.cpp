@@ -246,3 +246,16 @@ bool ES8388Control::identify(int sda, int scl, uint32_t frequency)
   Wire.beginTransmission(ES8388_ADDR);
   return Wire.endTransmission() == 0;
 }
+
+/**
+ * @brief set the microphone input gain for both channels, 0 is default at reset
+ *
+ * @param gain range [0 - 8] -> [0 ... +24db, step +3db]
+ */
+void ES8388Control::micGain(uint16_t gain)
+{
+  const uint32_t gain_val = gain > 8 ? 8 : gain;
+
+  // both channels get same gain
+  write_reg(ES8388_ADDR, ES8388_ADCCONTROL1, gain_val | gain_val << 4);
+}

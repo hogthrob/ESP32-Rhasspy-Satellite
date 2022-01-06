@@ -137,6 +137,17 @@ public:
     return a1s_pinouts[variant].i2s;
   }
 
+  virtual void setGain(uint16_t gain) {
+    if (is_es)
+    {
+      Serial.printf("Set Gain: %d\n", gain);
+      es8388.micGain(gain);
+    } else {
+
+    }
+  }
+
+
 private:
   void InitI2SSpeakerOrMic(int mode);
   AC101 ac;
@@ -232,7 +243,7 @@ void AudioKit::updateColors(StateColors colors)
     break;
   case COLORS_IDLE:
     // all lights are off
-    indicator_light->setState(OFF);
+    indicator_light->setState(ON);
     break;
   case COLORS_ERROR:
     // very quick blinking of LED
@@ -347,7 +358,7 @@ bool AudioKit::readAudio(uint8_t *data, size_t size)
     i2s_read(SPEAKER_I2S_NUMBER, data, size, &byte_read, pdMS_TO_TICKS(100));
   } else {
     // ES8388Control returns stereo stream from Mic, but we need only one channel,
-    // we drop channel 2 (right channel) here
+    // we drop channel 2 (aka MIC1) here
     uint16_t data2[size];
     uint16_t *data1 = (uint16_t *)data;
 
