@@ -166,8 +166,17 @@
 #include <General.hpp>
 #include <StateMachine.hpp>
 
+  void setup()
+  {
 
-void setup() {
+#if MQTT_TLS
+    if (MQTT_CA_CERT != NULL) {
+      net.setCACert(ca_cert);
+    } else {
+      net.setInsecure();
+    }
+#endif
+
   // store the main task handle, used to decided if in the 
   // FSM task (aka main loop) or in another task context. 
   fsm_task = xTaskGetCurrentTaskHandle();
@@ -175,17 +184,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Booting");
 
-  if (wbSemaphore == NULL)  // Not yet been created?
-  {
-    wbSemaphore = xSemaphoreCreateMutex();  // Create a mutex semaphore
-    if ((wbSemaphore) != NULL) xSemaphoreGive(wbSemaphore);  // Free for all
-  }
-
-  if (eventListSemaphore == NULL)  // Not yet been created?
-  {
-    eventListSemaphore = xSemaphoreCreateMutex();  // Create a mutex semaphore
-    if ((eventListSemaphore) != NULL) xSemaphoreGive(eventListSemaphore);  // Free for all
-  }
+  wbSemaphore = xSemaphoreCreateMutex();  // Create a mutex semaphore
+  eventListSemaphore = xSemaphoreCreateMutex();  // Create a mutex semaphore
+  audioServerSemaphore = xSemaphoreCreateMutex();
 
 
   device->init();
@@ -236,7 +237,7 @@ void setup() {
 
   server.on("/", handleRequest);
   server.begin();
-}
+  }
 
 void loop() {
   if (WiFi.isConnected()) {

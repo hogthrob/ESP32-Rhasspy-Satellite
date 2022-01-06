@@ -18,10 +18,15 @@
 #include "index_html.h"
 #include "Esp32RingBuffer.h"
 #include <map>
-// #include "WiFiClientSecure.h"
+#include <functional>
+#include <utility>
+
+#include "WiFiClientSecure.h"
 
 const int PLAY = BIT0;
 const int STREAM = BIT1;
+const int HOTWORD = BIT2;
+const int ASR = BIT3;
 
 enum {
   HW_LOCAL = 0,
@@ -84,10 +89,21 @@ std::string restartTopic = config.siteid + std::string("/restart");
 std::string sayTopic = "hermes/tts/say";
 std::string sayFinishedTopic = "hermes/tts/sayFinished";
 std::string errorTopic = "hermes/nlu/intentNotRecognized";
-AsyncMqttClient asyncClient; 
-//WiFiClientSecure net;
-WiFiClient net;
+AsyncMqttClient asyncClient;
 
+#ifdef MQTT_TLS
+WiFiClientSecure net;
+#ifdef MQTT_CA_CERT
+const char *ca_cert = "-----BEGIN CERTIFICATE-----\n" MQTT_CA_CERT "\n-----END CERTIFICATE-----";
+#endif
+#else
+WiFiClient net;
+// we can later use this in C++ conditions
+#define MQTT_TLS 0
+#ifndef MQTT_CA_CERT
+    #define MQTT_CA_CERT NULL
+#endif
+#endif
 
 PubSubClient audioServer(net); 
 Esp32RingBuffer<uint8_t, uint16_t, (1U << 15)> audioData;
@@ -98,8 +114,30 @@ int numChannels = 2;
 int bitDepth = 16;
 StateColors current_colors = COLORS_IDLE;
 static EventGroupHandle_t audioGroup;
-SemaphoreHandle_t wbSemaphore;
-SemaphoreHandle_t eventListSemaphore;
+
+
+SemaphoreHandle_t wbSemaphore; //< Guard access to the audio device object "device" . Any code accessing the device shall take the semaphore before doing so.
+SemaphoreHandle_t eventListSemaphore; //< Guard access to the fsm event list object "event_list" . Any code accessing the event_list shall take the semaphore before doing so. 
+SemaphoreHandle_t audioServerSemaphore; //< Guard access to the mqtt publisher object "audioServer" . Any code accessing the audioServer shall take the semaphore before doing so.
+
+/**
+ * @brief Wraps a critical section into SemaphoreTake/Give and executes user provided function callbacks (preferably lambda functions) in case of successfull or failed
+ * semaphore aquisition. failure function can be omitted. Never forgets to release the semaphore ;-)
+ * 
+ * @param sema which semaphore to lock
+ * @param criticalCode void() function with no parameters which will be executed in case of getting the lock
+ * @param failureCode void() function with no parameters which will be executed in case of failing to getting the lock in time.
+ */
+void criticalSection(SemaphoreHandle_t sema, std::function<void()> criticalCode, std::function<void()> failureCode = []() {} )
+{
+    if (xSemaphoreTake(sema, portMAX_DELAY)) {
+        criticalCode();
+        xSemaphoreGive(sema);
+    } else {
+        failureCode();
+    }
+}
+
 TaskHandle_t i2sHandle;
 
 struct WifiConnected;

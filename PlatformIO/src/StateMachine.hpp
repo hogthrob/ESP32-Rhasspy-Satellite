@@ -2,6 +2,7 @@
 #include <AsyncMqttClient.h>
 #include <PubSubClient.h>
 #include "Esp32RingBuffer.h"
+#include <set>
 
 class StateMachine
 : public tinyfsm::Fsm<StateMachine>
@@ -37,22 +38,22 @@ public:
     dispatch(BeginPlayAudioEvent());
     xEventGroupSetBits(audioGroup, PLAY);
   };
-  virtual void react(ListeningEvent const &) {};
-  virtual void react(UpdateConfigurationEvent const &) {
-    current_colors = COLORS_IDLE;
-    device->updateBrightness(config.brightness);
-    xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
-    device->updateColors(current_colors);
-    xSemaphoreGive(wbSemaphore);
+  virtual void react(ListeningEvent const &){};
+  virtual void react(UpdateConfigurationEvent const &)
+  {
+    criticalSection(wbSemaphore, []() {
+      device->updateBrightness(current_colors != COLORS_IDLE ? config.hotword_brightness : config.brightness);
+      device->updateColors(current_colors);
+    });
   };
 
   virtual void entry(void) {  
     xEventGroupClearBits(audioGroup, PLAY);
     xEventGroupClearBits(audioGroup, STREAM);
-    device->updateBrightness(config.brightness);
-    xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
-    device->updateColors(current_colors);
-    xSemaphoreGive(wbSemaphore);
+    criticalSection(wbSemaphore, []() {
+      device->updateBrightness(current_colors != COLORS_IDLE ? config.hotword_brightness : config.brightness);
+      device->updateColors(current_colors);
+    });
   }; 
   virtual void run(void) {}; 
   void         exit(void) {};
@@ -267,45 +268,59 @@ class MQTTDisconnected : public StateMachine {
   private:
   long currentMillis, startMillis;
 
-  void entry(void) override {
+  void entry(void) override
+  {
     Serial.println("Enter MQTTDisconnected");
     // no longer connected to MQTT, so device is no longer working nominally
     // => indicate this
     current_colors = COLORS_WIFI_CONNECTED;
-    device->updateColors(current_colors);
+    
+    criticalSection(wbSemaphore, []() { device->updateColors(current_colors); });
+
     startMillis = millis();
     currentMillis = millis();
-    if (audioServer.connected()) {
-      audioServer.disconnect();
-    }    
-    if (asyncClient.connected()) {
-      asyncClient.disconnect();
-    }
-    if (!mqttInitialized) {
-      asyncClient.onMessage(onMqttMessage);
-      mqttInitialized = true;
-    }
-    Serial.printf("Connecting MQTT: %s, %d\r\n", config.mqtt_host.c_str(), config.mqtt_port);
-    asyncClient.setClientId(config.siteid.c_str());
-    asyncClient.setServer(config.mqtt_host.c_str(), config.mqtt_port);
-    asyncClient.setCredentials(config.mqtt_user.c_str(), config.mqtt_pass.c_str());
-    audioServer.setServer(config.mqtt_host.c_str(), config.mqtt_port);
-    char clientID[100];
-    snprintf(clientID, 100, "%sAudio", config.siteid.c_str());
-    asyncClient.connect();
-    audioServer.connect(clientID, config.mqtt_user.c_str(), config.mqtt_pass.c_str());
+
+    criticalSection(audioServerSemaphore, []() {
+      if (audioServer.connected()) {
+        audioServer.disconnect();
+      }
+
+      if (asyncClient.connected()) {
+        asyncClient.disconnect();
+      }
+      if (!mqttInitialized) {
+        asyncClient.onMessage(onMqttMessage);
+        mqttInitialized = true;
+      }
+   
+      Serial.printf("Connecting MQTT: %s, %d\r\n", config.mqtt_host.c_str(), config.mqtt_port);
+      asyncClient.setClientId(config.siteid.c_str());
+      asyncClient.setServer(config.mqtt_host.c_str(), config.mqtt_port);
+      asyncClient.setCredentials(config.mqtt_user.c_str(), config.mqtt_pass.c_str());
+      asyncClient.connect();
+      audioServer.setServer(config.mqtt_host.c_str(), MQTT_TLS ? 8883 : config.mqtt_port);
+      audioServer.connect((config.siteid + "Audio").c_str(), config.mqtt_user.c_str(), config.mqtt_pass.c_str());
+    });
+
+    // give asyncServer some time to connect before proceeding
+    vTaskDelay(100);
   }
 
   void run(void) override {
-    if (audioServer.connected() && asyncClient.connected()) {
+    bool audioServer_connected = false;
+    criticalSection(audioServerSemaphore, [&]() {
+      audioServer_connected = audioServer.connected();
+    });
+
+    if (audioServer_connected && asyncClient.connected()) {
       transit<MQTTConnected>();
     } else {
       currentMillis = millis();
       if (currentMillis - startMillis > 5000) {
         Serial.println("Connect failed, retry");
-        Serial.printf("Audio connected: %d, Async connected: %d\r\n", audioServer.connected(), asyncClient.connected());
+        Serial.printf("Audio connected: %d, Async connected: %d\r\n", audioServer_connected, asyncClient.connected());
         transit<MQTTDisconnected>();
-      }      
+      }     
     }
   }
   
@@ -350,7 +365,7 @@ class WifiDisconnected : public StateMachine
     xEventGroupClearBits(audioGroup, PLAY);
     if (i2sHandle == NULL) {
       Serial.println("Creating I2Stask");
-      xTaskCreatePinnedToCore(I2Stask, "I2Stask", 30000, NULL, 3, &i2sHandle, 1);
+      xTaskCreatePinnedToCore(I2Stask, "I2Stask", 8192, NULL, 3, &i2sHandle, 1);
     } else {  
       Serial.println("We already have a I2Stask");
     }
@@ -506,7 +521,7 @@ void push_i2s_data(const uint8_t *const payload, size_t len)
     assert(len < audioData.maxSize());
     do
     {
-      if (xEventGroupGetBits(audioGroup) != PLAY)
+      if ((xEventGroupGetBits(audioGroup) & PLAY) != PLAY)
       {
         publishDebug("Send PlayBytesEvent");
         send_event(events::PlayBytesEvent);
@@ -544,7 +559,7 @@ void handle_playBytes(const std::string& topicstr, uint8_t *payload, size_t len,
   if (len + index == total)
   {    
     //At the end, make sure to start play in case the buffer is not full yet
-    if (!audioData.isEmpty() && xEventGroupGetBits(audioGroup) != PLAY)
+    if (!audioData.isEmpty() && (xEventGroupGetBits(audioGroup) & PLAY) != PLAY)
     {
       publishDebug("Send PlayBytesEvent");
       send_event(events::PlayBytesEvent);
@@ -560,14 +575,14 @@ void handle_playBytes(const std::string& topicstr, uint8_t *payload, size_t len,
 struct OnMqttMessageTopicAction
 {
   std::string& topicId; // which topic shall be handled, use   .topicId = *(new std::string("errorTopic")) to initialize with string constant
-  void (*action)(JsonObject& root); // pointer to function / lambda function to handle topics message
+  void (*action)(JsonObject& root, const std::string& topic); // pointer to function / lambda function to handle topics message
 };
 
 OnMqttMessageTopicAction onTopic[] =
 {
   {
   .topicId = errorTopic,
-  .action = [](JsonObject& root) {
+  .action = [](JsonObject& root, const std::string& topic) {
       if (root["siteId"] == config.siteid.c_str()) {
         Serial.println("Send ErrorEvent from errorTopic");
         send_event(events::ErrorEvent);
@@ -576,16 +591,16 @@ OnMqttMessageTopicAction onTopic[] =
   },
   {
   .topicId = sayFinishedTopic,
-  .action = [](JsonObject& root) {
+  .action = [](JsonObject& root, const std::string& topic) {
       if (root["siteId"] == config.siteid.c_str()) {
-        Serial.println("Send ListeningEvent from sayFinishedTopic");
-        send_event(events::ListeningEvent);
+        Serial.println("Send ListeningEvent or IdleEvent from sayFinishedTopic");
+        send_event((xEventGroupGetBits(audioGroup) & HOTWORD) == ASR ? events::ListeningEvent : events::IdleEvent);
       }
     }
   },
   {
   .topicId = sayTopic,
-  .action = [](JsonObject& root) {
+  .action = [](JsonObject& root, const std::string& topic) {
       if (root["siteId"] == config.siteid.c_str()) {
         Serial.println("Send TtsEvent from sayTopic");
         send_event(events::TtsEvent);
@@ -594,8 +609,9 @@ OnMqttMessageTopicAction onTopic[] =
   },
   {
     .topicId = *(new std::string("toggleOff")),
-    .action = [](JsonObject& root) {
+    .action = [](JsonObject& root, const std::string& topic) {
       if (root["siteId"] == config.siteid.c_str() && root.containsKey("reason")) {
+        xEventGroupClearBits(audioGroup, topic == "hermes/hotword/toggleOff" ? HOTWORD : ASR);
         if (root["reason"] == "dialogueSession") {
             Serial.println("Send ListeningEvent from toggleOff (dialogueSession)");
             send_event(events::ListeningEvent);
@@ -613,7 +629,19 @@ OnMqttMessageTopicAction onTopic[] =
   },
   {
     .topicId = *(new std::string("toggleOn")),
-    .action = [](JsonObject& root) {
+    .action = [](JsonObject& root, const std::string& topic) {
+      #if 1
+        static const std::set<std::string> reasons { "dialogueSession", "ttsSay", "playAudio" };
+        
+        auto reason = root.containsKey("reason") ? reasons.find(root["reason"].as<const char *>()) : reasons.end();
+        if (root["siteId"] == config.siteid.c_str() && reason != reasons.end())
+        {
+          xEventGroupSetBits(audioGroup, topic == "hermes/hotword/toggleOn" ? HOTWORD : ASR);
+          Serial.printf("Send IdleEvent from toggleOn (%s)\n", reason->c_str());
+          send_event(events::IdleEvent);
+        }
+        #endif
+#if 0
         if (root["siteId"] == config.siteid.c_str() && root.containsKey("reason")) {
           if (root["reason"] == "dialogueSession") {
               Serial.println("Send IdleEvent from toggleOn (dialogueSession)");
@@ -628,11 +656,12 @@ OnMqttMessageTopicAction onTopic[] =
               send_event(events::IdleEvent);
           }
         }
+#endif      
       }
   },
   {
     .topicId = ledTopic,
-    .action = [](JsonObject& root) {
+    .action = [](JsonObject& root, const std::string& topic) {
         bool saveNeeded = false;
 
         if (root.containsKey("animation")) {
@@ -698,7 +727,7 @@ OnMqttMessageTopicAction onTopic[] =
   },
   {
     .topicId = audioTopic,
-    .action = [](JsonObject& root) {
+    .action = [](JsonObject& root, const std::string& topic) {
         if (root.containsKey("mute_input")) {
           config.mute_input = (root["mute_input"] == "true") ? true : false;
         }
@@ -722,7 +751,7 @@ OnMqttMessageTopicAction onTopic[] =
   },
   {
     .topicId = restartTopic,
-    .action = [](JsonObject& root) {
+    .action = [](JsonObject& root, const std::string& topic) {
       if (root.containsKey("passwordhash")) {
         if (root["passwordhash"] == OTA_PASS_HASH) {
           ESP.restart();
@@ -732,20 +761,12 @@ OnMqttMessageTopicAction onTopic[] =
   },
   {
     .topicId = debugTopic,
-    .action = [](JsonObject& root) {
+    .action = [](JsonObject& root, const std::string& topic) {
         if (root.containsKey("debug")) {
           DEBUG = (root["debug"] == "true") ? true : false;
         }
     }
   },
-  {
-    .topicId = *(new std::string("toggleOff")),
-    .action = [](JsonObject& root) {
-
-    }
-  },
-
-
 };
 
 void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total)
@@ -755,6 +776,8 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
   // complete or end of message has been received
   if (len + index == total) {
     bool isHandled = false;
+
+    // handle JSON messages
     for(auto topicHandler: onTopic) {
       isHandled = topicstr.find(topicHandler.topicId) != std::string::npos; 
       if (isHandled) {
@@ -763,11 +786,11 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
         DeserializationError err = deserializeJson(doc, payloadstr.c_str());
         if (!err) {
           JsonObject root = doc.as<JsonObject>();
-          topicHandler.action(root);
+          topicHandler.action(root, topicstr);
         } else {
           publishDebug(err.c_str());
         }
-        // we are done with this loop, leave it
+        // we are done with this loop after first match, leave it
         break;
       }
     }
@@ -793,34 +816,30 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
   }
 }
 
-void I2Stask(void *p) {  
-  while (1) {    
-    if (xEventGroupGetBits(audioGroup) == PLAY) {
+void I2Stask(void *p)
+{
+  while (1) {
+    if ((xEventGroupGetBits(audioGroup) & PLAY) == PLAY) {
       size_t bytes_written;
       boolean timeout = false;
       int played = 44;
 
-      xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
+      xSemaphoreTake(wbSemaphore, portMAX_DELAY);
       device->setWriteMode(sampleRate, bitDepth, numChannels);
-      xSemaphoreGive(wbSemaphore); 
+      xSemaphoreGive(wbSemaphore);
 
-      while (played < message_size && timeout == false)
-      {
-        xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
+      while (played < message_size && timeout == false) {
+        xSemaphoreTake(wbSemaphore, portMAX_DELAY);
         device->animate(current_colors, config.animation);
-        xSemaphoreGive(wbSemaphore); 
+        xSemaphoreGive(wbSemaphore);
         int bytes_to_write = device->writeSize;
-        if (message_size - played < device->writeSize)
-        {
+        if (message_size - played < device->writeSize) {
           bytes_to_write = message_size - played;
         }
-        uint16_t data[bytes_to_write/2];
-        if (!timeout)
-        {
-          for (int i = 0; i < bytes_to_write/2; i++)
-          {
-            if (!audioData.pop(data[i]))
-            {
+        uint16_t data[bytes_to_write / 2];
+        if (!timeout) {
+          for (int i = 0; i < bytes_to_write / 2; i++) {
+            if (!audioData.pop(data[i])) {
               char message[100];
               snprintf(message, 100, "Buffer underflow %d %ld", played + i, message_size);
               publishDebug(message);
@@ -829,83 +848,79 @@ void I2Stask(void *p) {
             }
           }
           played = played + bytes_to_write;
-          if (!config.mute_output)
-          {
-            xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
+          if (!config.mute_output) {
+            xSemaphoreTake(wbSemaphore, portMAX_DELAY);
             device->muteOutput(false);
-            device->writeAudio((uint8_t*)data, bytes_to_write, &bytes_written);
+            device->writeAudio((uint8_t *)data, bytes_to_write, &bytes_written);
             xSemaphoreGive(wbSemaphore);
-          }
-          else
-          {
+          } else {
             bytes_written = bytes_to_write;
           }
-            if (bytes_written != bytes_to_write) {
-              char message[100];
-              snprintf(message, 100, "Bytes to write %d, but bytes written %d", bytes_to_write, bytes_written);
-              publishDebug(message);
+          if (bytes_written != bytes_to_write) {
+            char message[100];
+            snprintf(message, 100, "Bytes to write %d, but bytes written %d", bytes_to_write, bytes_written);
+            publishDebug(message);
           }
         }
       }
       asyncClient.publish(playFinishedTopic.c_str(), 0, false, finishedMsg.c_str());
-      xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
+      xSemaphoreTake(wbSemaphore, portMAX_DELAY);
       device->muteOutput(true);
-      xSemaphoreGive(wbSemaphore); 
+      xSemaphoreGive(wbSemaphore);
       audioData.clear();
 
       publishDebug("Done");
       publishDebug("Send StreamAudioEvent");
       send_event(events::StreamAudioEvent);
     }
-    if (xEventGroupGetBits(audioGroup) == STREAM && !config.mute_input) {     
-      xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
+
+    if ((xEventGroupGetBits(audioGroup) & STREAM) == STREAM && !config.mute_input) {
+      xSemaphoreTake(wbSemaphore, portMAX_DELAY);
       device->setReadMode();
-      xSemaphoreGive(wbSemaphore); 
+      xSemaphoreGive(wbSemaphore);
+
       uint8_t data[device->readSize * device->width];
-      if (audioServer.connected()) {
-        xSemaphoreTake(wbSemaphore, portMAX_DELAY); 
+
+      if (xSemaphoreTake(audioServerSemaphore, portMAX_DELAY) && audioServer.connected()) {
+        xSemaphoreTake(wbSemaphore, portMAX_DELAY);
         if (device->readAudio(data, device->readSize * device->width)) {
-          // only send audio if hotword_detection is HW_REMOTE.
-          //TODO when LOCAL is supported: check if hotword is detected and send audio as well in that case
-          // if (config.hotword_detection == HW_REMOTE)
-          {
-            //Rhasspy needs an audiofeed of 512 bytes+header per message
-            //Some devices, like the Matrix Voice do 512 16 bit read in one mic read
-            //This is 1024 bytes, so two message are needed in that case
-            const int messageBytes = 512;
-            uint8_t payload[sizeof(header) + messageBytes];
-            const int message_count = sizeof(data) / messageBytes;
-            for (int i = 0; i < message_count; i++) {
-              memcpy(payload, &header, sizeof(header));
-              memcpy(&payload[sizeof(header)], &data[messageBytes * i], messageBytes);
-              audioServer.publish(audioFrameTopic.c_str(),(uint8_t *)payload, sizeof(payload));
-            }
+          // Rhasspy needs an audiofeed of 512 bytes+header per message
+          // Some devices, like the Matrix Voice do 512 16 bit read in one mic read
+          // This is 1024 bytes, so two message are needed in that case
+          const int messageBytes = 512;
+          uint8_t payload[sizeof(header) + messageBytes];
+          const int message_count = sizeof(data) / messageBytes;
+          for (int i = 0; i < message_count; i++) {
+            memcpy(payload, &header, sizeof(header));
+            memcpy(&payload[sizeof(header)], &data[messageBytes * i], messageBytes);
+            audioServer.publish(audioFrameTopic.c_str(), payload, sizeof(payload));
           }
         }
-        xSemaphoreGive(wbSemaphore); 
+        xSemaphoreGive(wbSemaphore);
+        xSemaphoreGive(audioServerSemaphore);
       }
     }
-
     // keep the audioServer connection alive, also used to
     // monitor the MQTT Server, in order to detect
     // disconnection events
-    if (audioServer.connected()) {
-          //Loop, because otherwise this causes timeouts
-          audioServer.loop();
-    } else
-    {
-      // if we are not already in MQTTDisconnected state, try to get there
-      // this does not affect WifiDisconnected / WifiConnected, as these
-      // ignore our requests in order to establish Wifi connection before
-      // MQTT connection can be established
-      xEventGroupClearBits(audioGroup, STREAM|PLAY); 
-      
-      send_event(events::MQTTDisconnectedEvent);
+    if (fsm::is_in_state<WifiConnected>() == false && fsm::is_in_state<WifiDisconnected>() == false &&
+        fsm::is_in_state<MQTTDisconnected>() == false && xSemaphoreTake(audioServerSemaphore, portMAX_DELAY)) {
+      if (audioServer.connected()) {
+        // Loop, because otherwise this causes timeouts
+        audioServer.loop();
+      } else {
+        // if we are not already in MQTTDisconnected state, try to get there
+        // this does not affect WifiDisconnected / WifiConnected, as these
+        // ignore our requests in order to establish Wifi connection before
+        // MQTT connection can be established
+        xEventGroupClearBits(audioGroup, STREAM | PLAY);
+        send_event(events::MQTTDisconnectedEvent);
+      }
+      xSemaphoreGive(audioServerSemaphore);
     }
-    //Added for stability when neither PLAY or STREAM is set.
+    // Added for stability when neither PLAY or STREAM is set.
     vTaskDelay(10);
-
-  }  
+  }
   vTaskDelete(NULL);
 }
 
